@@ -1,86 +1,109 @@
-from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    pipeline,
+    BertForSequenceClassification,
+    BertTokenizer,
+    AutoModelForSequenceClassification,
+    AutoTokenizer
+)
 import torch
 from typing import Literal
 
-# Initialize models
-profanity_model_name = "Dabid/abusive-tagalog-profanity-detection"
-privacy_model_name = "roberta-base"
+# Configuration
+MODEL_PATHS = {
+    "profanity": "./bert_profanity_model",  # Your fine-tuned BERT model
+    "privacy": "roberta-base"  # Default privacy model
+}
 
-# Load profanity model
-profanity_tokenizer = AutoTokenizer.from_pretrained(profanity_model_name)
-profanity_model = AutoModelForSequenceClassification.from_pretrained(profanity_model_name)
+# Load models with error handling
+try:
+    # Load fine-tuned BERT profanity model
+    profanity_tokenizer = BertTokenizer.from_pretrained(MODEL_PATHS["profanity"])
+    profanity_model = BertForSequenceClassification.from_pretrained(MODEL_PATHS["profanity"])
+    
+    # Load privacy model
+    privacy_tokenizer = AutoTokenizer.from_pretrained(MODEL_PATHS["privacy"])
+    privacy_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATHS["privacy"])
+    
+except Exception as e:
+    raise RuntimeError(f"Failed to load models: {str(e)}")
 
-# Load privacy model
-privacy_tokenizer = AutoTokenizer.from_pretrained(privacy_model_name)
-privacy_model = AutoModelForSequenceClassification.from_pretrained(privacy_model_name)
-
-# Use GPU if available
+# Device configuration
 device = 0 if torch.cuda.is_available() else -1
 
-# Create classifiers
-profanity_classifier = pipeline(
-    "text-classification",
-    model=profanity_model,
-    tokenizer=profanity_tokenizer,
-    device=device,
-    framework="pt"
-)
-
-privacy_classifier = pipeline(
-    "text-classification",
-    model=privacy_model,
-    tokenizer=privacy_tokenizer,
-    device=device,
-    framework="pt"
-)
-
+# Initialize pipelines
+classifiers = {
+    "Profanity Detection": pipeline(
+        "text-classification",
+        model=profanity_model,
+        tokenizer=profanity_tokenizer,
+        device=device,
+        framework="pt",
+        truncation=True,
+        max_length=512
+    ),
+    "Privacy Violation": pipeline(
+        "text-classification",
+        model=privacy_model,
+        tokenizer=privacy_tokenizer,
+        device=device,
+        framework="pt",
+        truncation=True,
+        max_length=512
+    )
+}
 
 PROMPT_TEMPLATES = {
     "Profanity Detection": {
-        "system": """Detect profanity in debt collection conversations. Flag if the text contains:
-        1. Explicit swear words (e.g., "damn", "hell", "crap").
-        2. Threats ("Pay or else").
-        3. Derogatory terms ("idiot", "fraud").
-        4. Aggressive tone ("Listen up!").
-
-        Examples:
-        - Text: "Pay your damn bill!" → Label: 1
-        - Text: "Can we discuss payment options?" → Label: 0
-
+        "description": "Detects inappropriate language in financial conversations",
+        "label_map": {"LABEL_0": "Clean", "LABEL_1": "Profanity"}
+    },
+    "Privacy Violation": {
+        "system": """Analyze for privacy violations:
+        1. Check if financial details are shared before verification
+        2. Verify if proper authentication was skipped
         Text: "{text}"
         Label:""",
-        "label_map": {"LABEL_0": 0, "LABEL_1": 1}
-    },
-
-    "Privacy Violation": {
-        "system": """Flag privacy violations if:
-            1. Financial details (balance, account info) are shared **before** verifying:
-            - Full address, DOB, or SSN (last 4 digits).
-            2. Verification is skipped or unconfirmed by the customer.
-
-            Examples:
-            - No Violation: Agent asks for DOB first, then shares balance. → Label: 0
-            - Violation: Agent says, "You owe $300" without verification. → Label: 1
-
-            Text: "{text}"
-            Label:""",
-            "label_map": {"LABEL_0": 0, "LABEL_1": 1}
+        "label_map": {"LABEL_0": "Compliant", "LABEL_1": "Violation"}
     }
 }
 
-
-
 def analyze_text(text: str, analysis_type: Literal["Profanity Detection", "Privacy Violation"]):
-    """Analyses the given text using Profanity and Compliance LLMs."""
-    template = PROMPT_TEMPLATES[analysis_type]
+    """
+    Analyze text using appropriate model.
     
-    if analysis_type == "Profanity Detection":
-        # Use the Tagalog-English profanity model directly
-        result = profanity_classifier(text, truncation=True, max_length=512)
-        return 1 if result[0]['label'] == 'LABEL_1' else 0
-    else:
-        # Use RoBERTa with prompt engineering for privacy checks
-        prompt = template["system"].format(text=text)
-        result = privacy_classifier(prompt, truncation=True, max_length=512)
-        return template["label_map"][result[0]['label']]
-
+    Args:
+        text: Input text to analyze
+        analysis_type: Type of analysis to perform
+        
+    Returns:
+        dict: {
+            'label': str, 
+            'score': float,
+            'model': str
+        }
+    """
+    if not text.strip():
+        return {"error": "Empty input text"}
+    
+    try:
+        # Profanity detection (uses your fine-tuned BERT directly)
+        if analysis_type == "Profanity Detection":
+            result = classifiers[analysis_type](text)
+            return {
+                'label': PROMPT_TEMPLATES[analysis_type]["label_map"][result[0]['label']],
+                'score': float(result[0]['score']),
+                'model': "Fine-tuned BERT"
+            }
+        
+        # Privacy check (uses prompt engineering with RoBERTa)
+        else:
+            prompt = PROMPT_TEMPLATES[analysis_type]["system"].format(text=text)
+            result = classifiers[analysis_type](prompt)
+            return {
+                'label': PROMPT_TEMPLATES[analysis_type]["label_map"][result[0]['label']],
+                'score': float(result[0]['score']),
+                'model': "RoBERTa-base"
+            }
+            
+    except Exception as e:
+        return {"error": f"Analysis failed: {str(e)}"}
